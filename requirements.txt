@@ -1,0 +1,4 @@
+# Fork e commit já utilizados no projeto Chefinho Trader.
+git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git@7dd95a81c079e8af7a3728aa2aa194154f29ba3f
+python-dotenv==1.2.3
+python-telegram-bot==22.8
