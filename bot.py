@@ -3,10 +3,19 @@ import os
 import re
 import uuid
 from datetime import date
+from pathlib import Path
 
-from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from dotenv import load_dotenv, set_key
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 
 from iq_service import IQReadOnlyService
 from price_feed import MultiAssetPriceFeed
@@ -20,6 +29,8 @@ from settings import load_settings, save_settings
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OWNER = os.getenv("TELEGRAM_ALLOWED_USER_ID")
+ENV_FILE = Path(__file__).with_name(".env")
+CREDENTIAL_EMAIL, CREDENTIAL_PASSWORD = range(2)
 
 settings = load_settings()
 
@@ -87,6 +98,43 @@ def risk_text():
         f"Auto DEMO: {'LIGADO' if settings.get('autodemo_enabled') else 'DESLIGADO'}\n"
         f"Resultado registrado: {float(settings.get('daily_result', 0)):.2f}"
     )
+
+
+def panel_text(balance=None):
+    connection = "🟢 Conectada" if broker.is_connected(settings.get("account_mode", "PRACTICE")) else "⚪ Não conectada"
+    balance_text = f"💰 Saldo: {balance:.2f}" if balance is not None else "💰 Saldo: toque em Atualizar"
+    pending = sum(1 for signal in signal_list() if signal.get("status") == "PENDENTE")
+    credentials = "✅ Configuradas" if os.getenv("IQ_EMAIL") and os.getenv("IQ_PASSWORD") else "⚠️ Não configuradas"
+    return (
+        "🤖 CHEFINHO TRADE\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"🏦 Conta: {mode_label()}\n"
+        f"🔌 IQ Option: {connection}\n"
+        f"{balance_text}\n"
+        f"📌 Taxas pendentes: {pending}\n"
+        f"🤖 Auto DEMO: {'LIGADO' if settings.get('autodemo_enabled') else 'DESLIGADO'}\n"
+        f"🔐 Credenciais IQ: {credentials}\n\n"
+        "Entradas automáticas são permitidas somente em DEMO."
+    )
+
+
+def panel_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔌 Conectar", callback_data="panel:connect"),
+            InlineKeyboardButton("💰 Saldo", callback_data="panel:balance"),
+        ],
+        [
+            InlineKeyboardButton("🧪 Conta DEMO", callback_data="panel:practice"),
+            InlineKeyboardButton("👁️ Conta REAL", callback_data="panel:real"),
+        ],
+        [
+            InlineKeyboardButton("📌 Taxas", callback_data="panel:signals"),
+            InlineKeyboardButton("⚙️ Configuração", callback_data="panel:config"),
+        ],
+        [InlineKeyboardButton("🔐 Configurar IQ Option", callback_data="panel:credentials")],
+        [InlineKeyboardButton("🔄 Atualizar painel", callback_data="panel:refresh")],
+    ])
 
 
 def reset_daily_result_if_needed():
@@ -166,36 +214,103 @@ async def owner_only(update: Update):
     return False
 
 
+async def panel(update, context):
+    if not await owner_only(update):
+        return
+    await update.effective_message.reply_text(panel_text(), reply_markup=panel_keyboard())
+
+
+async def panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    balance = None
+
+    try:
+        if action == "connect":
+            async with broker_lock:
+                await asyncio.to_thread(broker.connect, settings.get("account_mode", "PRACTICE"))
+        elif action == "balance":
+            mode = settings.get("account_mode", "PRACTICE")
+            async with broker_lock:
+                await asyncio.to_thread(broker.ensure_connected, mode)
+                balance = await asyncio.to_thread(broker.balance)
+        elif action in ("practice", "real"):
+            settings["account_mode"] = "PRACTICE" if action == "practice" else "REAL"
+            save_settings(settings)
+            async with broker_lock:
+                await asyncio.to_thread(broker.close)
+        elif action == "signals":
+            pending = [signal for signal in signal_list() if signal.get("status") == "PENDENTE"]
+            summary = "\n".join(f"• {s['asset']} {float(s['preco']):g} {s['direcao']}" for s in pending[:8]) or "Nenhuma taxa pendente."
+            await query.message.reply_text(f"📌 TAXAS PENDENTES\n\n{summary}")
+        elif action == "config":
+            await query.message.reply_text("⚙️ CONFIGURAÇÃO\n\n" + risk_text())
+    except Exception as error:
+        await query.message.reply_text(f"❌ Não foi possível concluir: {type(error).__name__}: {error}")
+
+    await query.edit_message_text(panel_text(balance), reply_markup=panel_keyboard())
+
+
+async def credentials_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return ConversationHandler.END
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "🔐 CONFIGURAR IQ OPTION\n\nEnvie seu e-mail da IQ Option. A mensagem será apagada após a leitura."
+    )
+    return CREDENTIAL_EMAIL
+
+
+async def credentials_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    email = update.message.text.strip()
+    if "@" not in email or len(email) > 320:
+        await update.message.reply_text("Informe um e-mail válido ou use /cancelar.")
+        return CREDENTIAL_EMAIL
+    context.user_data["iq_email_pending"] = email
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    await update.effective_chat.send_message("Agora envie a senha da IQ Option. Esta mensagem também será apagada.")
+    return CREDENTIAL_PASSWORD
+
+
+async def credentials_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    password = update.message.text
+    email = context.user_data.pop("iq_email_pending", None)
+    if not email or not password:
+        await update.message.reply_text("Configuração cancelada. Abra o painel para tentar novamente.")
+        return ConversationHandler.END
+    set_key(str(ENV_FILE), "IQ_EMAIL", email)
+    set_key(str(ENV_FILE), "IQ_PASSWORD", password)
+    os.environ["IQ_EMAIL"] = email
+    os.environ["IQ_PASSWORD"] = password
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    async with broker_lock:
+        await asyncio.to_thread(broker.close)
+    await update.effective_chat.send_message("✅ Credenciais salvas localmente. Elas não são enviadas ao GitHub. Use Conectar no painel.")
+    return ConversationHandler.END
+
+
+async def credentials_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("iq_email_pending", None)
+    await update.effective_message.reply_text("Configuração de credenciais cancelada.")
+    return ConversationHandler.END
+
+
 # ============================================================
 # START
 # ============================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await owner_only(update):
-        return
-    await update.message.reply_text(
-        "🤖 CHEFINHO TRADE\n"
-        "Painel pessoal\n\n"
-        "/conectar - conectar na IQ Option\n"
-        "/saldo - consultar saldo\n"
-        "/demo - selecionar DEMO\n"
-        "/real - selecionar REAL para consulta\n\n"
-        "/config - ver configurações\n"
-        "/entrada 2.50 - valor da entrada\n"
-        "/duracao 1 - expiração\n"
-        "/stoploss 10 - stop loss\n"
-        "/stopwin 10 - stop win\n"
-        "/autodemo on - ativar entradas DEMO\n\n"
-        "/ativos - listar opções BINÁRIAS abertas\n"
-        "/sinal EURUSD-OTC 1.16534 PUT - adicionar taxa\n"
-        "/sinais - listar todas as taxas\n"
-        "/remover ID - remover uma taxa\n"
-        "/limpar - remover todas as taxas\n\n"
-        "📡 O feed é iniciado automaticamente para cada ativo com taxa armada.\n"
-        "🛡️ O ativo é verificado antes de armar.\n"
-        "🛡️ O ativo é verificado novamente imediatamente antes da compra.\n"
-        "🧪 Entradas automáticas somente em DEMO."
-    )
+    await panel(update, context)
 
 
 # ============================================================
@@ -798,8 +913,20 @@ def main():
         .build()
     )
 
+    credentials_conversation = ConversationHandler(
+        entry_points=[CallbackQueryHandler(credentials_start, pattern=r"^panel:credentials$")],
+        states={
+            CREDENTIAL_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, credentials_email)],
+            CREDENTIAL_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, credentials_password)],
+        },
+        fallbacks=[CommandHandler("cancelar", credentials_cancel)],
+    )
+    app.add_handler(credentials_conversation)
+    app.add_handler(CallbackQueryHandler(panel_callback, pattern=r"^panel:"))
+
     handlers = [
         ("start", start),
+        ("painel", panel),
         ("conectar", conectar),
         ("saldo", saldo),
         ("demo", demo),
