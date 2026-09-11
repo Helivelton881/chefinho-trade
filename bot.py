@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import uuid
 from datetime import date
 
 from dotenv import load_dotenv
@@ -8,25 +9,85 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from iq_service import IQReadOnlyService
-from price_feed import PriceFeed
+from price_feed import MultiAssetPriceFeed
 from settings import load_settings, save_settings
-from trigger import TriggerManager
+
+
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OWNER = os.getenv("TELEGRAM_ALLOWED_USER_ID")
+
 settings = load_settings()
-trigger, broker, price_feed, app_ref = TriggerManager(), IQReadOnlyService(), None, None
+
+# Compatibilidade com versões anteriores que guardavam sinais
+# como dict usando o ativo como chave.
+def normalize_signals():
+    raw = settings.get("signals", {})
+    if isinstance(raw, dict):
+        normalized = {}
+        for key, value in raw.items():
+            if not isinstance(value, dict):
+                continue
+            signal = dict(value)
+            signal.setdefault("id", str(key))
+            signal.setdefault("status", "PENDENTE")
+            normalized[str(signal["id"])] = signal
+        settings["signals"] = normalized
+    elif isinstance(raw, list):
+        normalized = {}
+        for value in raw:
+            if not isinstance(value, dict):
+                continue
+            signal = dict(value)
+            signal.setdefault("id", uuid.uuid4().hex[:8])
+            signal.setdefault("status", "PENDENTE")
+            normalized[str(signal["id"])] = signal
+        settings["signals"] = normalized
+    else:
+        settings["signals"] = {}
+
+
+normalize_signals()
+save_settings(settings)
+
+broker = IQReadOnlyService()
+price_feeds = {}
+feed_tasks = {}
+shared_feed = None
+shared_feed_task = None
+previous_prices = {}
+processing_signals = set()
+app_ref = None
+state_lock = asyncio.Lock()
+# A iqoptionapi não é segura para várias chamadas simultâneas na mesma conexão.
+# As tarefas dos sinais continuam independentes, mas o trecho que conversa
+# com o websocket da IQ Option é protegido por este lock.
+broker_lock = asyncio.Lock()
+
+
+# ============================================================
+# AUXILIARES
+# ============================================================
 
 def mode_label():
-    return "DEMO" if settings["account_mode"] == "PRACTICE" else "REAL (somente consulta)"
+    return "DEMO" if settings.get("account_mode") == "PRACTICE" else "REAL (somente consulta)"
+
 
 def risk_text():
-    return (f"Conta: {mode_label()}\nEntrada: {settings['entry_amount']:.2f}\n"
-            f"Expiração: {settings['expiration']} minuto(s)\n"
-            f"Stop loss: {settings['stop_loss']:.2f}\nStop win: {settings['stop_win']:.2f}\n"
-            f"Auto DEMO: {'LIGADO' if settings['autodemo_enabled'] else 'DESLIGADO'}\n"
-            f"Resultado registrado: {settings['daily_result']:.2f}")
+    return (
+        f"Conta: {mode_label()}\n"
+        f"Entrada: {float(settings.get('entry_amount', 2.50)):.2f}\n"
+        f"Expiração: {int(settings.get('expiration', 1))} minuto(s)\n"
+        f"Stop loss: {float(settings.get('stop_loss', 10)):.2f}\n"
+        f"Stop win: {float(settings.get('stop_win', 10)):.2f}\n"
+        f"Auto DEMO: {'LIGADO' if settings.get('autodemo_enabled') else 'DESLIGADO'}\n"
+        f"Resultado registrado: {float(settings.get('daily_result', 0)):.2f}"
+    )
+
 
 def reset_daily_result_if_needed():
     today = date.today().isoformat()
@@ -35,94 +96,206 @@ def reset_daily_result_if_needed():
         settings["daily_result"] = 0.0
         save_settings(settings)
 
+
 def can_open_demo_order():
     reset_daily_result_if_needed()
-    result = settings["daily_result"]
-    if result <= -settings["stop_loss"]:
+    result = float(settings.get("daily_result", 0))
+    stop_loss = float(settings.get("stop_loss", 10))
+    stop_win = float(settings.get("stop_win", 10))
+
+    if result <= -abs(stop_loss):
         return False, "Stop loss diário atingido."
-    if result >= settings["stop_win"]:
+    if result >= abs(stop_win):
         return False, "Stop win diário atingido."
-    if not settings["autodemo_enabled"]:
-        return False, "AUTODEMO está desligado. Use /autodemo on para habilitar."
-    if settings["account_mode"] != "PRACTICE":
+    if not settings.get("autodemo_enabled", False):
+        return False, "AUTODEMO está desligado. Use /autodemo on."
+    if settings.get("account_mode") != "PRACTICE":
         return False, "Entradas automáticas são permitidas somente em DEMO. Use /demo."
     return True, None
 
-async def owner_only(update):
+
+def signal_list():
+    return list(settings.get("signals", {}).values())
+
+
+def pending_signals_for_asset(asset):
+    asset = str(asset).upper().strip()
+    return [
+        s for s in signal_list()
+        if str(s.get("asset", "")).upper() == asset
+        and s.get("status", "PENDENTE") == "PENDENTE"
+    ]
+
+
+def signal_is_touched(signal, price, previous):
+    """Detecta cruzamento da taxa. Cada sinal possui seu próprio alvo."""
+    try:
+        target = float(signal["preco"])
+        current = float(price)
+    except (TypeError, ValueError, KeyError):
+        return False
+
+    if previous is None:
+        # Não dispara simplesmente porque o feed iniciou já além do alvo.
+        return False
+
+    direction = str(signal.get("direcao", "")).upper()
+    if direction == "CALL":
+        return previous < target <= current
+    if direction == "PUT":
+        return previous > target >= current
+    return False
+
+
+def remove_signal(signal_id):
+    return settings.get("signals", {}).pop(str(signal_id), None)
+
+
+# ============================================================
+# SEGURANÇA TELEGRAM
+# ============================================================
+
+async def owner_only(update: Update):
     if OWNER and str(update.effective_user.id) == OWNER:
         return True
     await update.effective_message.reply_text(
-        f"Acesso não autorizado. Seu Telegram ID é: {update.effective_user.id}\n"
-        "Defina TELEGRAM_ALLOWED_USER_ID com esse número no .env e reinicie."
+        "Acesso não autorizado.\n\n"
+        f"Seu Telegram ID é: {update.effective_user.id}\n\n"
+        "Defina TELEGRAM_ALLOWED_USER_ID no .env e reinicie."
     )
     return False
 
+
+# ============================================================
+# START
+# ============================================================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await owner_only(update): return
+    if not await owner_only(update):
+        return
     await update.message.reply_text(
-        "CHEFINHO TRADE - painel pessoal\n\n"
-        "/conectar - conectar usando credenciais locais do .env\n"
-        "/saldo - saldo da conta selecionada\n/demo ou /real - selecionar conta\n"
-        "/config - ver gestão\n/entrada 2.50 - valor de entrada\n"
-        "/duracao 1 - expiração em minutos\n"
-        "/stoploss 10 - limite de perda\n/stopwin 10 - meta de ganho\n"
-        "/autodemo on - habilitar entradas automáticas DEMO\n"
-        "/sinal EURUSD 1.16534 PUT - armar taxa\n/sinais - listar taxas\n/limpar - apagar taxas\n\n"
-        "O feed avisa quando a taxa é tocada. Nenhuma ordem é enviada."
+        "🤖 CHEFINHO TRADE\n"
+        "Painel pessoal\n\n"
+        "/conectar - conectar na IQ Option\n"
+        "/saldo - consultar saldo\n"
+        "/demo - selecionar DEMO\n"
+        "/real - selecionar REAL para consulta\n\n"
+        "/config - ver configurações\n"
+        "/entrada 2.50 - valor da entrada\n"
+        "/duracao 1 - expiração\n"
+        "/stoploss 10 - stop loss\n"
+        "/stopwin 10 - stop win\n"
+        "/autodemo on - ativar entradas DEMO\n\n"
+        "/ativos - listar opções BINÁRIAS abertas\n"
+        "/sinal EURUSD-OTC 1.16534 PUT - adicionar taxa\n"
+        "/sinais - listar todas as taxas\n"
+        "/remover ID - remover uma taxa\n"
+        "/limpar - remover todas as taxas\n\n"
+        "📡 O feed é iniciado automaticamente para cada ativo com taxa armada.\n"
+        "🛡️ O ativo é verificado antes de armar.\n"
+        "🛡️ O ativo é verificado novamente imediatamente antes da compra.\n"
+        "🧪 Entradas automáticas somente em DEMO."
     )
 
+
+# ============================================================
+# CONECTAR / SALDO / CONTA
+# ============================================================
+
 async def conectar(update, context):
-    if not await owner_only(update): return
+    if not await owner_only(update):
+        return
     try:
-        await asyncio.to_thread(broker.connect, settings["account_mode"])
-        await update.message.reply_text(f"Conexão confirmada: {mode_label()}. Nenhuma ordem foi enviada.")
+        async with broker_lock:
+            await asyncio.to_thread(broker.connect, settings.get("account_mode", "PRACTICE"))
+        await update.message.reply_text(
+            f"✅ Conexão confirmada: {mode_label()}\n\nNenhuma ordem foi enviada."
+        )
     except Exception as error:
-        await update.message.reply_text(f"Falha de conexão: {type(error).__name__}: {error}")
+        await update.message.reply_text(f"❌ Falha de conexão\n\n{type(error).__name__}: {error}")
+
 
 async def saldo(update, context):
-    if not await owner_only(update): return
+    if not await owner_only(update):
+        return
     try:
-        if broker.api is None or broker.mode != settings["account_mode"]:
-            await asyncio.to_thread(broker.connect, settings["account_mode"])
-        value = await asyncio.to_thread(broker.balance)
-        await update.message.reply_text(f"Saldo {mode_label()}: {value:.2f}")
+        mode = settings.get("account_mode", "PRACTICE")
+        async with broker_lock:
+            if broker.api is None or broker.mode != mode:
+                await asyncio.to_thread(broker.connect, mode)
+            value = await asyncio.to_thread(broker.balance)
+        await update.message.reply_text(f"💰 Saldo {mode_label()}: {value:.2f}")
     except Exception as error:
-        await update.message.reply_text(f"Não foi possível consultar o saldo: {error}")
+        await update.message.reply_text(f"❌ Não foi possível consultar o saldo:\n{error}")
+
 
 async def account(update, context, mode):
-    if not await owner_only(update): return
+    if not await owner_only(update):
+        return
     settings["account_mode"] = mode
     save_settings(settings)
-    await asyncio.to_thread(broker.close)
-    await update.message.reply_text(f"Conta selecionada: {mode_label()}. Use /saldo para confirmar.")
+    async with broker_lock:
+        await asyncio.to_thread(broker.close)
+    await update.message.reply_text(
+        f"Conta selecionada: {mode_label()}\n\nUse /saldo para confirmar."
+    )
 
-async def demo(update, context): await account(update, context, "PRACTICE")
-async def real(update, context): await account(update, context, "REAL")
+
+async def demo(update, context):
+    await account(update, context, "PRACTICE")
+
+
+async def real(update, context):
+    await account(update, context, "REAL")
+
+
+# ============================================================
+# CONFIGURAÇÕES
+# ============================================================
 
 async def config(update, context):
-    if await owner_only(update): await update.message.reply_text(risk_text())
+    if await owner_only(update):
+        await update.message.reply_text(risk_text())
+
 
 async def set_value(update, context, field, command):
-    if not await owner_only(update): return
+    if not await owner_only(update):
+        return
     try:
+        if len(context.args) != 1:
+            raise ValueError
         value = float(context.args[0].replace(",", "."))
-        if value <= 0 or len(context.args) != 1: raise ValueError
+        if value <= 0:
+            raise ValueError
     except (IndexError, ValueError):
         await update.message.reply_text(f"Uso: /{command} 10")
         return
     settings[field] = value
     save_settings(settings)
-    await update.message.reply_text(f"Configuração atualizada.\n\n{risk_text()}")
+    await update.message.reply_text("Configuração atualizada.\n\n" + risk_text())
 
-async def entrada(update, context): await set_value(update, context, "entry_amount", "entrada")
-async def stoploss(update, context): await set_value(update, context, "stop_loss", "stoploss")
-async def stopwin(update, context): await set_value(update, context, "stop_win", "stopwin")
+
+async def entrada(update, context):
+    await set_value(update, context, "entry_amount", "entrada")
+
+
+async def stoploss(update, context):
+    await set_value(update, context, "stop_loss", "stoploss")
+
+
+async def stopwin(update, context):
+    await set_value(update, context, "stop_win", "stopwin")
+
 
 async def duracao(update, context):
-    if not await owner_only(update): return
+    if not await owner_only(update):
+        return
     try:
+        if len(context.args) != 1:
+            raise ValueError
         value = int(context.args[0])
-        if len(context.args) != 1 or value not in (1, 5): raise ValueError
+        if value not in (1, 5):
+            raise ValueError
     except (IndexError, ValueError):
         await update.message.reply_text("Uso: /duracao 1 ou /duracao 5")
         return
@@ -130,8 +303,10 @@ async def duracao(update, context):
     save_settings(settings)
     await update.message.reply_text(f"Expiração DEMO definida para {value} minuto(s).")
 
+
 async def autodemo(update, context):
-    if not await owner_only(update): return
+    if not await owner_only(update):
+        return
     if len(context.args) != 1 or context.args[0].lower() not in ("on", "off"):
         await update.message.reply_text("Uso: /autodemo on ou /autodemo off")
         return
@@ -140,103 +315,525 @@ async def autodemo(update, context):
     save_settings(settings)
     state = "LIGADO" if enabled else "DESLIGADO"
     await update.message.reply_text(
-        f"AUTODEMO {state}. Entradas continuam restritas à conta DEMO."
+        f"🤖 AUTODEMO {state}\n\nEntradas automáticas continuam restritas à conta DEMO."
     )
 
+
+# ============================================================
+# ATIVOS
+# ============================================================
+
+async def ativos(update, context):
+    if not await owner_only(update):
+        return
+    try:
+        mode = settings.get("account_mode", "PRACTICE")
+        async with broker_lock:
+            if broker.api is None or broker.mode != mode:
+                await asyncio.to_thread(broker.connect, mode)
+            assets = await asyncio.to_thread(broker.get_open_binary_assets)
+        if not assets:
+            await update.message.reply_text("❌ Nenhuma opção BINÁRIA foi encontrada como aberta neste momento.")
+            return
+        # Telegram limita mensagens; envia blocos.
+        header = "📊 OPÇÕES BINÁRIAS ABERTAS\n\n"
+        lines = [f"🟢 {asset}" for asset in assets]
+        chunk = header
+        for line in lines:
+            if len(chunk) + len(line) + 1 > 3500:
+                await update.message.reply_text(chunk)
+                chunk = ""
+            chunk += line + "\n"
+        chunk += f"\nTotal: {len(assets)}"
+        await update.message.reply_text(chunk)
+    except Exception as error:
+        await update.message.reply_text(
+            f"❌ Erro ao consultar os ativos:\n\n{type(error).__name__}: {error}"
+        )
+
+
+# ============================================================
+# FEEDS DINÂMICOS
+# ============================================================
+
+async def run_feed_hub(feed):
+    global shared_feed, shared_feed_task
+    print("\n========================================")
+    print("PRICE FEED COMPARTILHADO")
+    print("========================================")
+
+    try:
+        await feed.start()
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        print(f"[ERRO] Feed compartilhado: {type(error).__name__}: {error}")
+    finally:
+        for asset, current_feed in list(price_feeds.items()):
+            if current_feed is feed:
+                price_feeds.pop(asset, None)
+                previous_prices.pop(asset, None)
+        shared_feed = None
+        shared_feed_task = None
+
+
+def ensure_feed(asset):
+    global shared_feed, shared_feed_task
+    asset = str(asset).upper().strip()
+    if shared_feed is not None and shared_feed_task is not None and not shared_feed_task.done():
+        shared_feed.add_asset(asset)
+        price_feeds[asset] = shared_feed
+        return
+    if app_ref is None:
+        return
+    shared_feed = MultiAssetPriceFeed([asset], candle_size=1, on_price=on_price)
+    price_feeds[asset] = shared_feed
+    # post_init roda antes de Application.run_polling; asyncio.create_task
+    # funciona tanto nessa fase quanto durante os comandos, sem o aviso PTB.
+    shared_feed_task = asyncio.create_task(run_feed_hub(shared_feed), name="feed-shared")
+
+
+async def stop_unused_feeds():
+    active_assets = {str(s.get("asset", "")).upper() for s in signal_list() if s.get("status") == "PENDENTE"}
+    for asset, feed in list(price_feeds.items()):
+        if asset not in active_assets:
+            try:
+                feed.remove_asset(asset)
+                price_feeds.pop(asset, None)
+            except Exception:
+                pass
+
+
+# ============================================================
+# ARMAR SINAL - AGORA SUPORTA QUANTAS TAXAS FOREM NECESSÁRIAS
+# ============================================================
+
 async def sinal(update, context):
-    if not await owner_only(update): return
-    match = re.fullmatch(r"([A-Z]{6})\s+([0-9]+(?:\.[0-9]+)?)\s+(CALL|PUT)", " ".join(context.args).upper())
+    if not await owner_only(update):
+        return
+
+    text = " ".join(context.args).upper().strip()
+    match = re.fullmatch(r"([A-Z0-9:/._-]+)\s+([0-9]+(?:\.[0-9]+)?)\s+(CALL|PUT)", text)
     if not match:
-        await update.message.reply_text("Uso: /sinal EURUSD 1.16534 PUT")
+        await update.message.reply_text(
+            "Uso:\n/sinal EURUSD-OTC 1.16534 PUT\n\n"
+            "Você pode adicionar várias taxas. Cada /sinal cria um ID independente."
+        )
         return
+
     asset, price, direction = match.groups()
-    if asset != "EURUSD":
-        await update.message.reply_text("Nesta versão, o feed monitora somente EURUSD.")
+    asset = broker.normalize_asset(asset)
+    target = float(price)
+
+    try:
+        # Primeira verificação antes de armar.
+        async with broker_lock:
+            status = await asyncio.to_thread(broker.get_binary_asset_status, asset)
+    except Exception as error:
+        await update.message.reply_text(
+            f"❌ Não foi possível verificar a disponibilidade do ativo.\n\n"
+            f"{type(error).__name__}: {error}\n\nA taxa NÃO foi armada."
+        )
         return
-    settings["signals"][asset] = {"asset": asset, "preco": float(price), "direcao": direction}
+
+    if not status.get("available"):
+        await update.message.reply_text(
+            "🔴 OPÇÃO INDISPONÍVEL\n\n"
+            f"Ativo: {asset}\nTaxa: {target:g}\nDireção: {direction}\n\n"
+            f"Motivo:\n{status.get('reason')}\n\n"
+            "❌ A taxa NÃO foi armada."
+        )
+        return
+
+    signal_id = uuid.uuid4().hex[:8]
+    signal = {
+        "id": signal_id,
+        "asset": asset,
+        "preco": target,
+        "direcao": direction,
+        "status": "PENDENTE",
+    }
+    settings["signals"][signal_id] = signal
     save_settings(settings)
-    if settings["autodemo_enabled"] and settings["account_mode"] == "PRACTICE":
-        status = "Uma entrada DEMO será enviada quando a taxa for tocada."
+
+    # Inicia apenas um feed por ativo. Várias taxas do mesmo ativo
+    # compartilham o mesmo feed, mas são avaliadas separadamente.
+    ensure_feed(asset)
+
+    if settings.get("autodemo_enabled") and settings.get("account_mode") == "PRACTICE":
+        execution_status = (
+            "🤖 AUTODEMO está LIGADO.\n"
+            "Uma entrada DEMO será tentada quando esta taxa for tocada.\n\n"
+            "⚠️ A disponibilidade será verificada novamente imediatamente antes da compra."
+        )
     else:
-        status = "Nenhuma ordem será enviada enquanto o AUTODEMO estiver desligado."
-    await update.message.reply_text(f"Taxa armada: {asset} {price} {direction}. {status}")
+        execution_status = (
+            "ℹ️ A taxa foi armada, mas nenhuma ordem será enviada.\n\n"
+            "AUTODEMO está desligado ou a conta selecionada não é DEMO."
+        )
+
+    await update.message.reply_text(
+        "🟢 TAXA ARMADA\n\n"
+        f"ID: {signal_id}\n"
+        f"Ativo: {asset}\n"
+        f"Taxa: {target:g}\n"
+        f"Direção: {direction}\n\n"
+        "Opção binária:\n🟢 DISPONÍVEL\n\n"
+        f"{execution_status}\n\n"
+        "Você pode adicionar outra taxa sem substituir esta."
+    )
+
+
+# ============================================================
+# LISTAR / REMOVER SINAIS
+# ============================================================
 
 async def sinais(update, context):
-    if not await owner_only(update): return
-    signals = settings["signals"]
-    text = "Nenhuma taxa armada." if not signals else "Taxas armadas:\n\n" + "\n".join(
-        f"{s['asset']} | {s['preco']} | {s['direcao']}" for s in signals.values())
-    await update.message.reply_text(text)
+    if not await owner_only(update):
+        return
+
+    signals = signal_list()
+    if not signals:
+        await update.message.reply_text("Nenhuma taxa armada.")
+        return
+
+    lines = ["📌 TAXAS ARMADAS\n"]
+    for index, signal in enumerate(signals, start=1):
+        status = signal.get("status", "PENDENTE")
+        lines.append(
+            f"{index}️⃣ ID {signal.get('id')}\n"
+            f"   🟢 {signal.get('asset')} | {float(signal.get('preco', 0)):g} | {signal.get('direcao')}"
+            f"\n   Status: {status}"
+        )
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def remover(update, context):
+    if not await owner_only(update):
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Uso: /remover ID\nExemplo: /remover a1b2c3d4")
+        return
+
+    signal_id = context.args[0].strip()
+    removed = remove_signal(signal_id)
+    if removed is None:
+        await update.message.reply_text("❌ ID não encontrado.")
+        return
+
+    save_settings(settings)
+    await stop_unused_feeds()
+    await update.message.reply_text(
+        f"🧹 Taxa removida: {removed.get('asset')} {float(removed.get('preco', 0)):g} {removed.get('direcao')}"
+    )
+
 
 async def limpar(update, context):
-    if not await owner_only(update): return
+    if not await owner_only(update):
+        return
     settings["signals"] = {}
-    trigger.triggered.clear(); trigger.previous_prices.clear()
     save_settings(settings)
-    await update.message.reply_text("Todas as taxas foram removidas.")
+    for feed in list(price_feeds.values()):
+        try:
+            feed.stop()
+        except Exception:
+            pass
+    await update.message.reply_text("🧹 Todas as taxas foram removidas.")
+
+
+# ============================================================
+# GATILHO DE PREÇO
+# ============================================================
 
 async def on_price(asset, price):
-    signal = settings["signals"].get(asset)
-    if signal is None or not trigger.check(signal, price): return
-    settings["signals"].pop(asset, None); save_settings(settings)
-    allowed, reason = can_open_demo_order()
-    if not allowed:
-        await app_ref.bot.send_message(chat_id=int(OWNER), text=(
-            f"GATILHO ATIVADO, SEM ENTRADA\n\nAtivo: {asset}\n"
-            f"Taxa: {signal['preco']}\nPreço: {price}\nMotivo: {reason}"))
-        return
+    asset = str(asset).upper().strip()
+    if asset.startswith("FRONT."):
+        asset = asset[6:]
 
     try:
+        current = float(price)
+    except (TypeError, ValueError):
+        return
+
+    previous = previous_prices.get(asset)
+    previous_prices[asset] = current
+
+    # IMPORTANTE: todos os sinais do mesmo ativo são avaliados.
+    candidates = [
+        s for s in signal_list()
+        if str(s.get("asset", "")).upper() == asset
+        and s.get("status", "PENDENTE") == "PENDENTE"
+        and str(s.get("id")) not in processing_signals
+    ]
+
+    for signal in candidates:
+        if not signal_is_touched(signal, current, previous):
+            continue
+
+        signal_id = str(signal.get("id"))
+        if signal_id in processing_signals:
+            continue
+        processing_signals.add(signal_id)
+        signal["status"] = "ACIONADO"
+        save_settings(settings)
+
+        # Cada taxa recebe seu próprio processamento.
+        app_ref.create_task(
+            process_triggered_signal(signal, current),
+            name=f"signal-{signal_id}"
+        )
+
+
+async def execute_practice_order_safe(amount, asset, direction, expiration):
+    """
+    Executa uma entrada DEMO num ciclo isolado.
+
+    Cada taxa recebe seu próprio websocket em PRACTICE. Isso permite que
+    sinais tocados juntos façam a confirmação e a compra sem uma fila global.
+    A mesma conexão fica reservada para acompanhar o resultado daquela ordem.
+    """
+    order_broker = IQReadOnlyService()
+    try:
+        await asyncio.to_thread(
+            order_broker.ensure_connected,
+            "PRACTICE",
+        )
         order_id = await asyncio.to_thread(
-            broker.place_practice_order,
-            settings["entry_amount"], asset, signal["direcao"], settings["expiration"],
+            order_broker.place_practice_order,
+            amount,
+            asset,
+            direction,
+            expiration,
+        )
+        return order_id, order_broker
+    except Exception:
+        await asyncio.to_thread(order_broker.close)
+        raise
+
+
+async def process_triggered_signal(signal, price):
+    signal_id = str(signal.get("id"))
+    asset = str(signal.get("asset"))
+    try:
+        allowed, reason = can_open_demo_order()
+        if not allowed:
+            signal["status"] = "BLOQUEADO"
+            save_settings(settings)
+            await app_ref.bot.send_message(
+                chat_id=int(OWNER),
+                text=(
+                    "🚨 GATILHO ATIVADO\n\n"
+                    f"ID: {signal_id}\n"
+                    f"Ativo: {asset}\n"
+                    f"Taxa: {signal['preco']}\n"
+                    f"Preço: {price}\n"
+                    f"Direção: {signal['direcao']}\n\n"
+                    "❌ ENTRADA NÃO EXECUTADA\n\n"
+                    f"Motivo:\n{reason}"
+                )
+            )
+            return
+
+        # NÃO serializamos as compras. Cada sinal cria uma instância
+        # independente do serviço IQ Option, com sua própria conexão.
+        # Isso permite que duas ou mais taxas tocadas no mesmo instante
+        # façam suas verificações e compras em paralelo sem compartilhar
+        # a mesma conexão websocket da iqoptionapi.
+        amount = float(settings.get("entry_amount", 2.50))
+        expiration = int(settings.get("expiration", 1))
+
+        try:
+            order_id, order_broker = await execute_practice_order_safe(
+                amount,
+                asset,
+                signal["direcao"],
+                expiration,
+            )
+        except Exception as error:
+            signal["status"] = "ERRO"
+            save_settings(settings)
+            error_text = str(error)
+            if any(word in error_text.lower() for word in ("indisponível", "fechad", "not available", "inactive")):
+                message = (
+                    "🚨 GATILHO ATIVADO\n\n"
+                    f"ID: {signal_id}\n"
+                    f"Ativo: {asset}\n"
+                    f"Taxa: {signal['preco']}\n"
+                    f"Preço: {price}\n"
+                    f"Direção: {signal['direcao']}\n\n"
+                    "🔴 OPÇÃO FICOU INDISPONÍVEL\n\n"
+                    f"{error_text}\n\n❌ Nenhuma ordem foi enviada."
+                )
+            else:
+                message = (
+                    "🚨 GATILHO ATIVADO\n\n"
+                    f"ID: {signal_id}\n"
+                    f"Ativo: {asset}\n"
+                    f"Taxa: {signal['preco']}\n"
+                    f"Preço: {price}\n"
+                    f"Direção: {signal['direcao']}\n\n"
+                    "❌ ENTRADA DEMO FALHOU\n\n"
+                    f"{type(error).__name__}: {error_text}"
+                )
+            await app_ref.bot.send_message(chat_id=int(OWNER), text=message)
+            return
+
+        # A taxa que disparou deixa de ser pendente, mas outras taxas
+        # continuam armadas normalmente.
+        signal["status"] = "EXECUTADO"
+        signal["order_id"] = str(order_id)
+        save_settings(settings)
+
+        await app_ref.bot.send_message(
+            chat_id=int(OWNER),
+            text=(
+                "🟢 ENTRADA DEMO ABERTA\n\n"
+                f"ID: {signal_id}\n"
+                f"Ativo: {asset}\n"
+                f"Direção: {signal['direcao']}\n"
+                f"Taxa: {signal['preco']}\n"
+                f"Preço: {price}\n\n"
+                f"Valor: {float(settings.get('entry_amount', 2.50)):.2f}\n"
+                f"Expiração: {int(settings.get('expiration', 1))} min\n\n"
+                f"Ordem: {order_id}"
+            )
+        )
+
+        app_ref.create_task(
+            track_demo_result(order_id, order_broker, signal_id),
+            name=f"result-{order_id}"
+        )
+    finally:
+        processing_signals.discard(signal_id)
+        await stop_unused_feeds()
+
+
+async def get_practice_result_safe(order_broker, order_id):
+    """
+    Consulta o resultado DEMO de forma segura.
+
+    Cada resultado usa exclusivamente o websocket do seu próprio ciclo DEMO.
+    """
+    return await asyncio.to_thread(order_broker.wait_practice_result, order_id)
+
+
+# ============================================================
+# RESULTADO DEMO
+# ============================================================
+
+async def track_demo_result(order_id, order_broker, signal_id=None):
+    try:
+        profit = await get_practice_result_safe(order_broker, order_id)
+        reset_daily_result_if_needed()
+        settings["daily_result"] = float(settings.get("daily_result", 0)) + profit
+        save_settings(settings)
+
+        outcome = "🟢 WIN" if profit > 0 else "🔴 LOSS" if profit < 0 else "⚪ EMPATE"
+        await app_ref.bot.send_message(
+            chat_id=int(OWNER),
+            text=(
+                f"RESULTADO DEMO: {outcome}\n\n"
+                f"ID: {signal_id or '-'}\n"
+                f"Resultado: {profit:.2f}\n"
+                f"Acumulado diário: {float(settings['daily_result']):.2f}"
+            )
         )
     except Exception as error:
-        await app_ref.bot.send_message(chat_id=int(OWNER), text=(
-            f"GATILHO ATIVADO, MAS A ENTRADA DEMO FALHOU\n\n{type(error).__name__}: {error}"))
-        return
+        await app_ref.bot.send_message(
+            chat_id=int(OWNER),
+            text=(
+                "⚠️ Não foi possível obter o resultado da DEMO.\n\n"
+                f"ID: {signal_id or '-'}\n"
+                f"Ordem: {order_id}\n"
+                f"Erro: {error}"
+            )
+        )
+    finally:
+        await asyncio.to_thread(order_broker.close)
 
-    await app_ref.bot.send_message(chat_id=int(OWNER), text=(
-        f"ENTRADA DEMO ABERTA\n\nAtivo: {asset}\nDireção: {signal['direcao']}\n"
-        f"Valor: {settings['entry_amount']:.2f}\nExpiração: {settings['expiration']} min\n"
-        f"Ordem: {order_id}"))
-    app_ref.create_task(track_demo_result(order_id), name=f"demo-order-{order_id}")
 
-async def track_demo_result(order_id):
-    try:
-        profit = await asyncio.to_thread(broker.wait_practice_result, order_id)
-        reset_daily_result_if_needed()
-        settings["daily_result"] += profit
-        save_settings(settings)
-        outcome = "WIN" if profit > 0 else "LOSS" if profit < 0 else "EMPATE"
-        await app_ref.bot.send_message(chat_id=int(OWNER), text=(
-            f"RESULTADO DEMO: {outcome}\n\nResultado: {profit:.2f}\n"
-            f"Acumulado diário: {settings['daily_result']:.2f}"))
-    except Exception as error:
-        await app_ref.bot.send_message(chat_id=int(OWNER), text=(
-            f"Não foi possível obter o resultado da DEMO {order_id}: {error}"))
+# ============================================================
+# INICIALIZAÇÃO / SHUTDOWN
+# ============================================================
 
-async def run_feed(application):
-    global price_feed, app_ref
+async def post_init(application):
+    global app_ref
     app_ref = application
-    price_feed = PriceFeed("EURUSD", on_price=on_price)
-    await price_feed.start()
 
-async def post_init(application): application.create_task(run_feed(application), name="eurusd-feed")
+    # Recupera taxas pendentes após reiniciar o bot.
+    for signal in signal_list():
+        if signal.get("status", "PENDENTE") == "PENDENTE":
+            ensure_feed(signal.get("asset"))
+
+
 async def post_shutdown(application):
-    if price_feed: price_feed.stop()
-    await asyncio.to_thread(broker.close)
+    for feed in list(price_feeds.values()):
+        try:
+            feed.stop()
+        except Exception:
+            pass
+    price_feeds.clear()
+    feed_tasks.clear()
+    async with broker_lock:
+        await asyncio.to_thread(broker.close)
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    if not TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN não encontrado no .env")
-    if not OWNER: print("Defina TELEGRAM_ALLOWED_USER_ID no .env antes de usar o bot.")
-    app = Application.builder().token(TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
-    for name, handler in [("start",start),("conectar",conectar),("saldo",saldo),("demo",demo),("real",real),
-                          ("config",config),("entrada",entrada),("stoploss",stoploss),("stopwin",stopwin),
-                          ("duracao",duracao),("autodemo",autodemo),
-                          ("sinal",sinal),("sinais",sinais),("limpar",limpar)]:
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN não encontrado no .env")
+
+    if not OWNER:
+        print("⚠️ Defina TELEGRAM_ALLOWED_USER_ID no .env.")
+
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    handlers = [
+        ("start", start),
+        ("conectar", conectar),
+        ("saldo", saldo),
+        ("demo", demo),
+        ("real", real),
+        ("config", config),
+        ("entrada", entrada),
+        ("stoploss", stoploss),
+        ("stopwin", stopwin),
+        ("duracao", duracao),
+        ("autodemo", autodemo),
+        ("ativos", ativos),
+        ("sinal", sinal),
+        ("sinais", sinais),
+        ("remover", remover),
+        ("limpar", limpar),
+    ]
+
+    for name, handler in handlers:
         app.add_handler(CommandHandler(name, handler))
-    print("CHEFINHO TRADE: painel Telegram + feed EURUSD (somente leitura).")
+
+    print("\n====================================")
+    print("🤖 CHEFINHO TRADE")
+    print("====================================")
+    print("🟢 Telegram conectado")
+    print("🟢 Sistema de múltiplas taxas concorrentes carregado")
+    print("🛡️ Verificação de disponibilidade ativa")
+    print("🛡️ Confirmação antes da compra ativa")
+    print("🧪 Entradas automáticas somente DEMO")
+    print("📡 Feed dinâmico por ativo")
+    print("⚡ Entradas simultâneas isoladas por conexão")
+    print("====================================\n")
+
     app.run_polling()
 
-if __name__ == "__main__": main()
+
+if __name__ == "__main__":
+    main()
