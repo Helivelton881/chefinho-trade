@@ -62,7 +62,39 @@ def normalize_signals():
         settings["signals"] = {}
 
 
+def signal_key(signal):
+    """Identifica uma taxa de forma única: ativo, preço e direção."""
+    try:
+        price = f"{float(signal.get('preco')):.10f}"
+    except (TypeError, ValueError):
+        price = ""
+    asset = str(signal.get("asset", "")).upper().strip()
+    if asset.startswith("FRONT."):
+        asset = asset[6:]
+    return (
+        asset,
+        price,
+        str(signal.get("direcao", "")).upper().strip(),
+    )
+
+
+def keep_only_unique_pending_signals():
+    """Remove histórico concluído e duplicatas deixadas por versões antigas."""
+    unique = {}
+    seen = set()
+    for signal_id, signal in settings.get("signals", {}).items():
+        if signal.get("status", "PENDENTE") != "PENDENTE":
+            continue
+        key = signal_key(signal)
+        if not all(key) or key in seen:
+            continue
+        seen.add(key)
+        unique[str(signal_id)] = signal
+    settings["signals"] = unique
+
+
 normalize_signals()
+keep_only_unique_pending_signals()
 save_settings(settings)
 
 broker = IQReadOnlyService()
@@ -539,6 +571,13 @@ async def sinal(update, context):
     asset, price, direction = match.groups()
     asset = broker.normalize_asset(asset)
     target = float(price)
+    candidate_key = signal_key({"asset": asset, "preco": target, "direcao": direction})
+
+    if any(signal_key(signal) == candidate_key for signal in signal_list()):
+        await update.message.reply_text(
+            "⚠️ Esta taxa já está armada. Nenhuma taxa duplicada foi criada."
+        )
+        return
 
     try:
         # Primeira verificação antes de armar.
@@ -682,15 +721,25 @@ async def on_price(asset, price):
         and str(s.get("id")) not in processing_signals
     ]
 
+    triggered_keys = set()
     for signal in candidates:
         if not signal_is_touched(signal, current, previous):
             continue
 
         signal_id = str(signal.get("id"))
+        key = signal_key(signal)
+        if key in triggered_keys:
+            # Proteção para dados antigos que ainda possam conter duplicatas.
+            remove_signal(signal_id)
+            save_settings(settings)
+            continue
         if signal_id in processing_signals:
             continue
+        triggered_keys.add(key)
         processing_signals.add(signal_id)
-        signal["status"] = "ACIONADO"
+        # A taxa deixa de existir antes da compra. Mesmo se a corretora
+        # recusar a ordem ou o bot reiniciar, ela não poderá disparar duas vezes.
+        remove_signal(signal_id)
         save_settings(settings)
 
         # Cada taxa recebe seu próprio processamento.
