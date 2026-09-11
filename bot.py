@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import sys
 import uuid
 from datetime import date
 from pathlib import Path
@@ -26,10 +27,15 @@ from settings import load_settings, save_settings
 # CONFIGURAÇÃO
 # ============================================================
 
-load_dotenv()
+APP_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+ENV_FILE = APP_DIR / ".env"
+load_dotenv(ENV_FILE)
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OWNER = os.getenv("TELEGRAM_ALLOWED_USER_ID")
-ENV_FILE = Path(__file__).with_name(".env")
 CREDENTIAL_EMAIL, CREDENTIAL_PASSWORD = range(2)
 
 settings = load_settings()
@@ -1000,4 +1006,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--self-test" in sys.argv:
+        print("CHEFINHO TRADE: executável carregado com sucesso.")
+        print(f"Pasta de configuração: {APP_DIR}")
+    else:
+        main()

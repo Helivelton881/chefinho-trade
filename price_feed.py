@@ -1,12 +1,22 @@
 import asyncio
 import inspect
 import os
+import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 from dotenv import load_dotenv
 from iqoptionapi.constants import ACTIVES
 from iqoptionapi.stable_api import IQ_Option
+
+
+APP_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+ENV_FILE = APP_DIR / ".env"
 
 
 class PriceFeed:
@@ -45,7 +55,7 @@ class PriceFeed:
         return asset
 
     def _connect(self):
-        load_dotenv()
+        load_dotenv(ENV_FILE)
 
         email = os.getenv("IQ_EMAIL")
         password = os.getenv("IQ_PASSWORD")

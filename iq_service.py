@@ -9,11 +9,21 @@ Chefinho Trade - integração segura com a IQ Option.
 """
 
 import os
+import sys
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 from dotenv import load_dotenv
 from iqoptionapi.stable_api import IQ_Option
+
+
+APP_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+ENV_FILE = APP_DIR / ".env"
 
 
 class IQReadOnlyService:
@@ -22,7 +32,7 @@ class IQReadOnlyService:
         self.mode: Optional[str] = None
 
     def connect(self, mode: str = "PRACTICE") -> bool:
-        load_dotenv()
+        load_dotenv(ENV_FILE)
         email = os.getenv("IQ_EMAIL")
         password = os.getenv("IQ_PASSWORD")
 
