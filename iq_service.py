@@ -5,7 +5,7 @@ Chefinho Trade - integração segura com a IQ Option.
 - Verifica disponibilidade de opções BINÁRIAS.
 - Evita get_all_open_time(), que apresentou erro na versão instalada.
 - Usa get_all_init_v2() -> binary -> actives.
-- Compras automáticas SOMENTE em PRACTICE.
+- Compras automáticas na conta escolhida: PRACTICE ou REAL.
 """
 
 import os
@@ -331,11 +331,26 @@ class IQReadOnlyService:
         result = self.check_asset_availability(asset)
         return result["available"], result["reason"]
 
-    def place_practice_order(self, amount, asset, direction, expiration):
-        """Executa compra BINÁRIA somente em PRACTICE, após duas verificações."""
-        self.ensure_connected("PRACTICE")
-        if self.api is None or self.mode != "PRACTICE":
-            raise RuntimeError("Compra automática bloqueada: a conta não é PRACTICE.")
+    def place_practice_order(self, amount, asset, direction, expiration, mode="PRACTICE"):
+        """Executa compra BINÁRIA na conta selecionada, após duas verificações."""
+        mode = str(mode).upper().strip()
+        if mode not in ("PRACTICE", "REAL"):
+            raise RuntimeError(f"Modo inválido para compra: {mode}.")
+        self.ensure_connected(mode)
+        if self.api is None or self.mode != mode:
+            raise RuntimeError(f"Compra automática bloqueada: conta {mode} não confirmada.")
+
+        # A biblioteca mantém o balance_id em estado global. Reaplicamos a
+        # carteira escolhida imediatamente antes das verificações e da compra.
+        try:
+            self.api.change_balance(mode)
+            confirmed_mode = self.api.get_balance_mode()
+        except Exception as error:
+            raise RuntimeError(f"Não foi possível selecionar a conta {mode}: {error}") from error
+        if confirmed_mode != mode:
+            raise RuntimeError(
+                f"Conta divergente antes da compra: solicitado {mode}, confirmado {confirmed_mode}."
+            )
 
         asset = self.normalize_asset(asset)
         direction = str(direction).lower().strip()
@@ -400,26 +415,26 @@ class IQReadOnlyService:
 
         if not success:
             raise RuntimeError(
-                f"A IQ Option não aceitou a entrada DEMO. Ativo: {asset}. Retorno: {order_id}"
+                f"A IQ Option não aceitou a entrada {mode}. Ativo: {asset}. Retorno: {order_id}"
             )
 
         print("========================================")
-        print("ENTRADA DEMO EXECUTADA")
+        print(f"ENTRADA {mode} EXECUTADA")
         print("========================================")
         print(f"Ativo:      {asset}")
         print(f"Direção:    {direction.upper()}")
         print(f"Valor:      {amount:.2f}")
         print(f"Expiração:  {expiration} minuto(s)")
         print(f"Ordem ID:   {order_id}")
-        print("Conta:      PRACTICE")
+        print(f"Conta:      {mode}")
         print("========================================\n")
         return order_id
 
     def wait_practice_result(self, order_id):
         if self.api is None:
             raise RuntimeError("Conta não conectada.")
-        if self.mode != "PRACTICE":
-            raise RuntimeError("Consulta de resultado automático permitida somente em PRACTICE.")
+        if self.mode not in ("PRACTICE", "REAL"):
+            raise RuntimeError("Conta da ordem não confirmada para consultar o resultado.")
         if order_id is None:
             raise RuntimeError("ID da ordem não informado.")
         try:

@@ -74,8 +74,8 @@ class PriceFeed:
                 connected, reason = candidate.connect()
                 if not connected:
                     raise RuntimeError(reason or "A IQ Option recusou a conexão.")
-                # Segurança: o feed continua exclusivamente em PRACTICE/DEMO.
-                candidate.change_balance("PRACTICE")
+                # O feed é somente leitura e não altera a carteira escolhida
+                # pelo painel para as operações.
             except Exception as error:
                 last_error = error
                 try:
@@ -267,7 +267,7 @@ class PriceFeed:
             self.running = True
 
             print(
-                "PRICE FEED conectado em PRACTICE"
+                "PRICE FEED conectado (somente leitura)"
             )
 
             print(
@@ -420,7 +420,7 @@ class PriceFeed:
 
 
 class MultiAssetPriceFeed(PriceFeed):
-    """Um único websocket PRACTICE para todos os ativos com taxas armadas."""
+    """Um único websocket de leitura para todos os ativos com taxas armadas."""
 
     def __init__(self, assets, candle_size=1, on_price=None):
         normalized = {self.normalize_asset(asset) for asset in assets}
@@ -510,7 +510,7 @@ class MultiAssetPriceFeed(PriceFeed):
             print("CHEFINHO TRADE - FEED COMPARTILHADO")
             print("=" * 50)
             await asyncio.to_thread(self._reconnect)
-            print("PRICE FEED conectado em PRACTICE")
+            print("PRICE FEED conectado (somente leitura)")
 
             while self.running:
                 try:

@@ -123,7 +123,7 @@ broker_lock = asyncio.Lock()
 # ============================================================
 
 def mode_label():
-    return "DEMO" if settings.get("account_mode") == "PRACTICE" else "REAL (somente consulta)"
+    return "DEMO" if settings.get("account_mode") == "PRACTICE" else "REAL"
 
 
 def risk_text():
@@ -150,9 +150,9 @@ def panel_text(balance=None):
         f"🔌 IQ Option: {connection}\n"
         f"{balance_text}\n"
         f"📌 Taxas pendentes: {pending}\n"
-        f"🤖 Auto DEMO: {'LIGADO' if settings.get('autodemo_enabled') else 'DESLIGADO'}\n"
+        f"🤖 Operação automática: {'LIGADA' if settings.get('autodemo_enabled') else 'DESLIGADA'}\n"
         f"🔐 Credenciais IQ: {credentials}\n\n"
-        "Entradas automáticas são permitidas somente em DEMO."
+        "As entradas serão enviadas para a conta selecionada no painel."
     )
 
 
@@ -183,7 +183,7 @@ def reset_daily_result_if_needed():
         save_settings(settings)
 
 
-def can_open_demo_order():
+def can_open_order():
     reset_daily_result_if_needed()
     result = float(settings.get("daily_result", 0))
     stop_loss = float(settings.get("stop_loss", 10))
@@ -194,9 +194,9 @@ def can_open_demo_order():
     if result >= abs(stop_win):
         return False, "Stop win diário atingido."
     if not settings.get("autodemo_enabled", False):
-        return False, "AUTODEMO está desligado. Use /autodemo on."
-    if settings.get("account_mode") != "PRACTICE":
-        return False, "Entradas automáticas são permitidas somente em DEMO. Use /demo."
+        return False, "A operação automática está desligada. Use /autodemo on."
+    if settings.get("account_mode") not in ("PRACTICE", "REAL"):
+        return False, "Selecione a conta DEMO ou REAL no painel."
     return True, None
 
 
@@ -465,7 +465,8 @@ async def autodemo(update, context):
     save_settings(settings)
     state = "LIGADO" if enabled else "DESLIGADO"
     await update.message.reply_text(
-        f"🤖 AUTODEMO {state}\n\nEntradas automáticas continuam restritas à conta DEMO."
+        f"🤖 OPERAÇÃO AUTOMÁTICA {state}\n\n"
+        f"As entradas serão enviadas para a conta {mode_label()} selecionada no painel."
     )
 
 
@@ -617,16 +618,16 @@ async def sinal(update, context):
     # compartilham o mesmo feed, mas são avaliadas separadamente.
     ensure_feed(asset)
 
-    if settings.get("autodemo_enabled") and settings.get("account_mode") == "PRACTICE":
+    if settings.get("autodemo_enabled"):
         execution_status = (
-            "🤖 AUTODEMO está LIGADO.\n"
-            "Uma entrada DEMO será tentada quando esta taxa for tocada.\n\n"
+            "🤖 OPERAÇÃO AUTOMÁTICA está LIGADA.\n"
+            f"Uma entrada {mode_label()} será tentada quando esta taxa for tocada.\n\n"
             "⚠️ A disponibilidade será verificada novamente imediatamente antes da compra."
         )
     else:
         execution_status = (
             "ℹ️ A taxa foi armada, mas nenhuma ordem será enviada.\n\n"
-            "AUTODEMO está desligado ou a conta selecionada não é DEMO."
+            "A operação automática está desligada."
         )
 
     await update.message.reply_text(
@@ -740,6 +741,7 @@ async def on_price(asset, price):
             continue
         triggered_keys.add(key)
         processing_signals.add(signal_id)
+        signal["account_mode"] = settings.get("account_mode", "PRACTICE")
         # A taxa deixa de existir antes da compra. Mesmo se a corretora
         # recusar a ordem ou o bot reiniciar, ela não poderá disparar duas vezes.
         remove_signal(signal_id)
@@ -752,9 +754,9 @@ async def on_price(asset, price):
         )
 
 
-async def execute_practice_order_safe(amount, asset, direction, expiration):
+async def execute_order_safe(amount, asset, direction, expiration, mode):
     """
-    Executa a entrada DEMO pela conexão principal protegida.
+    Executa a entrada na conta escolhida pela conexão principal protegida.
 
     A iqoptionapi usa estado global e não tolera bem várias instâncias
     conectadas ao mesmo tempo. Os sinais continuam em tarefas independentes;
@@ -763,7 +765,7 @@ async def execute_practice_order_safe(amount, asset, direction, expiration):
     async with broker_lock:
         await asyncio.to_thread(
             broker.ensure_connected,
-            "PRACTICE",
+            mode,
         )
         order_id = await asyncio.to_thread(
             broker.place_practice_order,
@@ -771,6 +773,7 @@ async def execute_practice_order_safe(amount, asset, direction, expiration):
             asset,
             direction,
             expiration,
+            mode,
         )
         return order_id
 
@@ -778,8 +781,10 @@ async def execute_practice_order_safe(amount, asset, direction, expiration):
 async def process_triggered_signal(signal, price):
     signal_id = str(signal.get("id"))
     asset = str(signal.get("asset"))
+    mode = str(signal.get("account_mode", settings.get("account_mode", "PRACTICE"))).upper()
+    account_name = "DEMO" if mode == "PRACTICE" else "REAL"
     try:
-        allowed, reason = can_open_demo_order()
+        allowed, reason = can_open_order()
         if not allowed:
             signal["status"] = "BLOQUEADO"
             save_settings(settings)
@@ -804,11 +809,12 @@ async def process_triggered_signal(signal, price):
         expiration = int(settings.get("expiration", 1))
 
         try:
-            order_id = await execute_practice_order_safe(
+            order_id = await execute_order_safe(
                 amount,
                 asset,
                 signal["direcao"],
                 expiration,
+                mode,
             )
         except Exception as error:
             signal["status"] = "ERRO"
@@ -833,7 +839,7 @@ async def process_triggered_signal(signal, price):
                     f"Taxa: {signal['preco']}\n"
                     f"Preço: {price}\n"
                     f"Direção: {signal['direcao']}\n\n"
-                    "❌ ENTRADA DEMO FALHOU\n\n"
+                    f"❌ ENTRADA {account_name} FALHOU\n\n"
                     f"{type(error).__name__}: {error_text}"
                 )
             await app_ref.bot.send_message(chat_id=int(OWNER), text=message)
@@ -848,7 +854,7 @@ async def process_triggered_signal(signal, price):
         await app_ref.bot.send_message(
             chat_id=int(OWNER),
             text=(
-                "🟢 ENTRADA DEMO ABERTA\n\n"
+                f"🟢 ENTRADA {account_name} ABERTA\n\n"
                 f"ID: {signal_id}\n"
                 f"Ativo: {asset}\n"
                 f"Direção: {signal['direcao']}\n"
@@ -861,7 +867,7 @@ async def process_triggered_signal(signal, price):
         )
 
         app_ref.create_task(
-            track_demo_result(order_id, signal_id),
+            track_demo_result(order_id, signal_id, account_name),
             name=f"result-{order_id}"
         )
     finally:
@@ -879,10 +885,10 @@ async def get_practice_result_safe(order_id):
 
 
 # ============================================================
-# RESULTADO DEMO
+# RESULTADO DA OPERAÇÃO
 # ============================================================
 
-async def track_demo_result(order_id, signal_id=None):
+async def track_demo_result(order_id, signal_id=None, account_name="DEMO"):
     try:
         profit = await get_practice_result_safe(order_id)
         reset_daily_result_if_needed()
@@ -893,7 +899,7 @@ async def track_demo_result(order_id, signal_id=None):
         await app_ref.bot.send_message(
             chat_id=int(OWNER),
             text=(
-                f"RESULTADO DEMO: {outcome}\n\n"
+                f"RESULTADO {account_name}: {outcome}\n\n"
                 f"ID: {signal_id or '-'}\n"
                 f"Resultado: {profit:.2f}\n"
                 f"Acumulado diário: {float(settings['daily_result']):.2f}"
@@ -903,7 +909,7 @@ async def track_demo_result(order_id, signal_id=None):
         await app_ref.bot.send_message(
             chat_id=int(OWNER),
             text=(
-                "⚠️ Não foi possível obter o resultado da DEMO.\n\n"
+                f"⚠️ Não foi possível obter o resultado da conta {account_name}.\n\n"
                 f"ID: {signal_id or '-'}\n"
                 f"Ordem: {order_id}\n"
                 f"Erro: {error}"
@@ -997,7 +1003,7 @@ def main():
     print("🟢 Sistema de múltiplas taxas concorrentes carregado")
     print("🛡️ Verificação de disponibilidade ativa")
     print("🛡️ Confirmação antes da compra ativa")
-    print("🧪 Entradas automáticas somente DEMO")
+    print("🏦 Entradas automáticas na conta selecionada: DEMO ou REAL")
     print("📡 Feed dinâmico por ativo")
     print("⚡ Entradas simultâneas isoladas por conexão")
     print("====================================\n")
