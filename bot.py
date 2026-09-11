@@ -208,7 +208,7 @@ def pending_signals_for_asset(asset):
 
 
 def signal_is_touched(signal, price, previous):
-    """Detecta cruzamento da taxa. Cada sinal possui seu próprio alvo."""
+    """Detecta toque/cruzamento da taxa, qualquer que seja a aproximação."""
     try:
         target = float(signal["preco"])
         current = float(price)
@@ -216,15 +216,12 @@ def signal_is_touched(signal, price, previous):
         return False
 
     if previous is None:
-        # Não dispara simplesmente porque o feed iniciou já além do alvo.
-        return False
+        # Não dispara por iniciar além do alvo, mas aceita preço exatamente igual.
+        return current == target
 
-    direction = str(signal.get("direcao", "")).upper()
-    if direction == "CALL":
-        return previous < target <= current
-    if direction == "PUT":
-        return previous > target >= current
-    return False
+    # CALL/PUT define a direção da compra. A taxa deve acionar tanto quando
+    # o preço chega subindo quanto quando chega descendo.
+    return min(previous, current) <= target <= max(previous, current)
 
 
 def remove_signal(signal_id):
@@ -751,29 +748,25 @@ async def on_price(asset, price):
 
 async def execute_practice_order_safe(amount, asset, direction, expiration):
     """
-    Executa uma entrada DEMO num ciclo isolado.
+    Executa a entrada DEMO pela conexão principal protegida.
 
-    Cada taxa recebe seu próprio websocket em PRACTICE. Isso permite que
-    sinais tocados juntos façam a confirmação e a compra sem uma fila global.
-    A mesma conexão fica reservada para acompanhar o resultado daquela ordem.
+    A iqoptionapi usa estado global e não tolera bem várias instâncias
+    conectadas ao mesmo tempo. Os sinais continuam em tarefas independentes;
+    somente o envio ao websocket é feito em uma pequena fila segura.
     """
-    order_broker = IQReadOnlyService()
-    try:
+    async with broker_lock:
         await asyncio.to_thread(
-            order_broker.ensure_connected,
+            broker.ensure_connected,
             "PRACTICE",
         )
         order_id = await asyncio.to_thread(
-            order_broker.place_practice_order,
+            broker.place_practice_order,
             amount,
             asset,
             direction,
             expiration,
         )
-        return order_id, order_broker
-    except Exception:
-        await asyncio.to_thread(order_broker.close)
-        raise
+        return order_id
 
 
 async def process_triggered_signal(signal, price):
@@ -799,16 +792,13 @@ async def process_triggered_signal(signal, price):
             )
             return
 
-        # NÃO serializamos as compras. Cada sinal cria uma instância
-        # independente do serviço IQ Option, com sua própria conexão.
-        # Isso permite que duas ou mais taxas tocadas no mesmo instante
-        # façam suas verificações e compras em paralelo sem compartilhar
-        # a mesma conexão websocket da iqoptionapi.
+        # Cada sinal mantém seu próprio processamento. A chamada curta de
+        # compra passa pela conexão principal para não corromper o websocket.
         amount = float(settings.get("entry_amount", 2.50))
         expiration = int(settings.get("expiration", 1))
 
         try:
-            order_id, order_broker = await execute_practice_order_safe(
+            order_id = await execute_practice_order_safe(
                 amount,
                 asset,
                 signal["direcao"],
@@ -865,7 +855,7 @@ async def process_triggered_signal(signal, price):
         )
 
         app_ref.create_task(
-            track_demo_result(order_id, order_broker, signal_id),
+            track_demo_result(order_id, signal_id),
             name=f"result-{order_id}"
         )
     finally:
@@ -873,22 +863,22 @@ async def process_triggered_signal(signal, price):
         await stop_unused_feeds()
 
 
-async def get_practice_result_safe(order_broker, order_id):
+async def get_practice_result_safe(order_id):
     """
     Consulta o resultado DEMO de forma segura.
 
-    Cada resultado usa exclusivamente o websocket do seu próprio ciclo DEMO.
+    O resultado usa a conexão principal sem abrir outro websocket.
     """
-    return await asyncio.to_thread(order_broker.wait_practice_result, order_id)
+    return await asyncio.to_thread(broker.wait_practice_result, order_id)
 
 
 # ============================================================
 # RESULTADO DEMO
 # ============================================================
 
-async def track_demo_result(order_id, order_broker, signal_id=None):
+async def track_demo_result(order_id, signal_id=None):
     try:
-        profit = await get_practice_result_safe(order_broker, order_id)
+        profit = await get_practice_result_safe(order_id)
         reset_daily_result_if_needed()
         settings["daily_result"] = float(settings.get("daily_result", 0)) + profit
         save_settings(settings)
@@ -913,8 +903,6 @@ async def track_demo_result(order_id, order_broker, signal_id=None):
                 f"Erro: {error}"
             )
         )
-    finally:
-        await asyncio.to_thread(order_broker.close)
 
 
 # ============================================================

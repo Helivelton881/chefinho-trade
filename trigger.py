@@ -33,25 +33,10 @@ class TriggerManager:
             if current_price == target:
                 triggered = True
 
-        # =====================================================
-        # PUT
-        # =====================================================
-
-        elif direction == "PUT":
-
-            # Cruzamento para baixo ou toque
-            if previous_price >= target and current_price <= target:
-                triggered = True
-
-        # =====================================================
-        # CALL
-        # =====================================================
-
-        elif direction == "CALL":
-
-            # Cruzamento para cima ou toque
-            if previous_price <= target and current_price >= target:
-                triggered = True
+        # CALL/PUT define a direção da entrada, não o sentido pelo qual o
+        # preço deve alcançar a taxa. Qualquer toque ou cruzamento aciona.
+        elif min(previous_price, current_price) <= target <= max(previous_price, current_price):
+            triggered = True
 
         # Guarda o preço atual para o próximo tick
         self.previous_prices[asset] = current_price
